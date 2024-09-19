@@ -1,5 +1,28 @@
 import torch
 from sklearn.model_selection import train_test_split
+import pandas as pd
+
+def preprocess_columns_and_nas(df):
+    """This function generates target column and preprocesses date
+
+    Args:
+        df (_type_): _description_
+    """
+
+    # Create a new column, Target, with Close lagged by one period
+    df['Target'] = df['Close'].shift(1)
+
+    # Drop NA values since they are first observtions
+    df = df.dropna()
+
+    # Generate class: growth in one day or not
+    df['Growth'] = df.apply(lambda row: 1 if row['Target'] > row['Close'] else 0, axis=1)
+
+    # Convert 'Date' column to datetime format
+    df.index = pd.to_datetime(df.index)
+    
+    return df
+
 
 def preprocess_torch(X, y):
     """This function preprocesses a df with Y column and X columns and converts to torch data types

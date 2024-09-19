@@ -8,7 +8,7 @@ import matplotlib.ticker as ticker  # Correct import for MaxNLocator
 from _1_load_ta_data_yfin import get_ta_historical_dataset
 from _2_build_model import Model
 from plotting_functions.plot_prices_mas import plot_price_ta
-from preprocessing_functions import preprocess_torch
+from preprocessing_functions import preprocess_torch, preprocess_columns_and_nas
 
 ticker_symbol = 'AAPL'
 timewindow = "2y"
@@ -17,17 +17,7 @@ print("Executing")
 df = get_ta_historical_dataset(ticker_symbol, timewindow)
 print("Df generated")
 
-# Create a new column, Target, with Close lagged by one period
-df['Target'] = df['Close'].shift(1)
-
-# Drop NA values since they are first observtions
-df = df.dropna()
-
-# Generate class: growth in one day or not
-df['Growth'] = df.apply(lambda row: 1 if row['Target'] > row['Close'] else 0, axis=1)
-
-# Convert 'Date' column to datetime format
-df.index = pd.to_datetime(df.index)
+df = preprocess_columns_and_nas(df)
 
 # Plot prices and technical indicators
 plot_price_ta(df)
@@ -36,6 +26,7 @@ plot_price_ta(df)
 X = df.drop(['Open', 'High', 'Low', 'Target'], axis=1)
 y = df['Growth']
 
+# Convert to torch types
 X_train, X_test, y_train, y_test, num_features = preprocess_torch(X, y)
 
 # Initialize model
