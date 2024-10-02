@@ -1,0 +1,770 @@
+---
+title: "Apple_ARIMA"
+format: html
+editor: visual
+---
+
+## Prerequisites
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(psych)
+library(forecast)
+library(zoo)
+library(tseries)
+library(Metrics)
+library(tidyr)
+library(lmtest)
+library(FinTS)
+library(rugarch)
+library(rmgarch)
+library(MTS)
+library(gridExtra)
+library(reshape2)
+```
+
+```{r}
+rm(list =ls())
+```
+
+## Load Apple data
+
+```{r}
+df <- read.csv("apple_2y.csv")
+head(df)
+```
+
+## Time series appropiate procedure
+
+1.  Limpiar y preprocesar datos (NAs, regularidad de los datos).
+2.  Observar componentes de la serie por separado (para ver si hay patrón aditivo o multiplicativo)
+3.  Si es multiplicativo y la serie no es estacionaria, aplicar transformacion de Box Cox, (para ver si así se convierte en estacionaria).
+4.  Si la serie sigue sin ser estacionaria al quitar el patron multiplicativo, diferenciar la serie (R dirá si la diferenciación debe ser estacional o regular).
+5.  Si la serie sigue sin ser estacionaria, aplicar un suavizado.
+6.  Una vez se tiene una serie estacionaria, se calculan acf (para hallar p) y pacf (para hallar q). Estos parámetros se estiman "a ojo".
+7.  Utilizar métodos para escoger apropiadamente p,q: paso previo, auto.arima, AIC y métrica de error (RMSE o MSE).
+8.  Comprobar normalidad, homocedasticidad e independencia de los residuos.
+9.  Ampliar utilizando modelos de volatilidad estocástica (ARCH, GARCH).
+10. Hacer predicciones en un horizonte temporal "razonable".
+
+## 1. Data cleaning and preprocessing
+
+Remove irrelevant data and convert to appropiate format
+
+```{r}
+# keep date and close columns
+df <- df[c("Date", "Close")]
+df$Date <- as.Date(df$Date)
+
+# Also generate df with returns instead of raw prices
+df_ret <- df
+df_ret <- df_ret %>%
+  mutate(Return = (Close / lag(Close) - 1))
+
+# And delete first row (no values for first observation) and Price column
+df_ret <- df_ret[, -which(names(df) == "Close")]
+df_ret <- df_ret[-1, ]
+```
+
+Check that there are no NA values
+
+```{r}
+any(is.na(df))
+```
+
+Description of the data
+
+```{r}
+summary(df$Close)
+```
+
+Data cleaning - including a regularity
+
+```{r}
+# Name significant variables
+dates <- df$Date
+prices <- df$Close
+
+dates_ret <- df_ret$Date
+returns <- df_ret$Return
+
+# Convert to time series format 
+ts_data <- zoo(df$Close, order.by = df$Date)
+ts_ret_data <- zoo(df_ret$Return, order.by = df_ret$Date)
+
+# Include a regularity (i.e., data for all days, equally spaced)
+all_dates <- seq(min(dates), max(dates), by = "day")
+all_dates_ret <- seq(min(dates_ret), max(dates_ret), by = "day")
+
+# Include all weekends
+ts <- merge(ts_data, zoo(, all_dates))
+ts <- na.approx(ts)
+
+ts_ret <- merge(ts_ret_data, zoo(, all_dates_ret))
+ts_ret <- na.approx(ts_ret)
+
+# Create df as well
+df_full <- data.frame(Date = index(ts), Close = coredata(ts))
+df_full_ret <- data.frame(Date = index(ts_ret), Close = coredata(ts_ret))
+```
+
+**Visual representation (Prices)**
+
+```{r}
+ggplot(df_full, aes(x = Date, y = Close)) +
+  geom_line(color = "blue") +
+  geom_hline(aes(yintercept = mean(Close)), linetype = "dashed", color = "red") +
+  labs(title = "AAPL Closing Price", 
+       x = "Date", 
+       y = "Price") +
+  theme_minimal()
+```
+
+**Visual representation (Returns)**
+
+```{r}
+ggplot(df_ret, aes(x = Date, y = Return)) +
+  geom_line(color = "blue") +
+  geom_hline(aes(yintercept = mean(Return)), linetype = "dashed", color = "red") +
+  labs(title = "AAPL Daily Returns", 
+       x = "Date", 
+       y = "Price") +
+  theme_minimal()
+```
+
+## 2. Time Series components
+
+Trend, cycle and station
+
+```{r}
+transformed_df <- df_full
+
+# Define trend as ( last value - first value ) / length of time series
+trend <- (df_full$Close[nrow(df_full)] - df_full$Close[1])/nrow(df_full)
+transformed_df$Index <- 1:nrow(transformed_df)
+
+# Remove trend from time series
+transformed_df$Detrend <- transformed_df$Close - transformed_df$Index*trend - df_full$Close[1]
+
+# Remove intermediate columns once unnecessary
+transformed_df <- transformed_df %>% select(-Index)
+
+# Plot series without the trend 
+ggplot(transformed_df, aes(x = Date, y = Detrend)) +
+  geom_line(color = "blue") +
+  geom_hline(aes(yintercept = 0), linetype = "dashed", color = "red") +
+  labs(title = "AAPL Detrended Price", 
+       x = "Date", 
+       y = "Price") +
+  theme_minimal()
+```
+
+```{r}
+# IF we want to decompose, then a number of data points will be removed so that there are complete cycles for the function (i.e., multiples of 365)
+
+df_analyze <- df_full %>% slice(-1:-2)
+ts_analyze <- as.ts(df_analyze$Close, frequency = 365)
+```
+
+```{r}
+# fit<-decompose(ts_analyze, type="additive")
+```
+
+## 3. Box Cox transformation
+
+## 4. See if it's stationary
+
+**Stationarity in Returns**
+
+Check for **stationarity** using Augmented Dickey-Fuller Test
+
+```{r}
+adf.test(ts_ret)
+```
+
+As expected, returns are highly stationary
+
+## 5. (En principio no es necesario aplicar suavizado porque la serie ya se espera que sea estacionaria tras las transformaciones previas)
+
+## 6. Plot results from acf and pacf functions: Returns
+
+From now on, results will be obtained for returns, not raw prices.
+
+These plots will show information about what p and q can be expected to be.
+
+```{r}
+# Calculate ACF
+acf_values <- acf(ts_ret, na.action = na.pass)
+par(mar = c(3, 3, 2, 1))  # Decrease margins
+```
+
+```{r}
+# Calculate PACF
+pacf_values <- pacf(ts_ret, na.action = na.pass)
+par(mar = c(3, 3, 2, 1))  
+```
+
+## 7. Choose p, q
+
+**Auto.arima: evaluates models by looking at their AIC. Then, chooses p, q accordingly**
+
+**AIC: Akaike Information Criterion.** statistical tool used to compare the goodness of fit of different time series models with varying numbers of lags.
+
+-   The formula is: *AIC = 2 \* k -2 \* log-likelihood*
+
+-   Given a time series data, We can fit several models with different numbers of lags, such as an AR(1) model with one lag, an AR(2) model with two lags, and so on. We can then calculate the log-likelihood function for each model, which measures how well the model fits the data.
+
+-   AIC also considers complexity (k represents number of variables included) and thus penalizes it in some way RMSE does not.
+
+**AIC**
+
+```{r}
+# Auto.arima 
+best_aic_model <- auto.arima(ts_ret)
+p_aic <- best_aic_model$arma[1]
+q_aic <- best_aic_model$arma[2]
+aic_auto <- AIC(best_aic_model)
+
+cat("Best ARMA Model (AIC): ARMA(", p_aic, ",", q_aic, ")\n")
+```
+
+```{r}
+# Obtener los valores ajustados del modelo ARIMA
+fitted_values_aic <- fitted(best_aic_model)
+
+# Crear un data frame con los datos originales y ajustados
+df_plot <- data.frame(
+  Date = index(ts_ret),
+  Original = coredata(ts_ret),
+  Fitted = coredata(fitted_values_aic)
+)
+
+# Graficar la serie temporal original y los valores ajustados del modelo ARIMA
+ggplot(df_plot, aes(x = Date)) +
+  geom_line(aes(y = Original, color = "Original")) +  # Serie original
+  geom_line(aes(y = Fitted, color = "Fitted"), linetype = "dashed") +  # Valores ajustados
+  labs(title = paste("ARIMA Model (AIC) Adjusted by p =", p_auto, "and q =", q_auto),
+       x = "Dates",
+       y = "Values",
+       color = "Series") +
+  theme_minimal()
+
+```
+
+```{r}
+rmse_aic <- rmse(coredata(ts_ret), coredata(fitted_values_aic))
+cat("RMSE of AIC model: ", rmse_aic)
+```
+
+Check if coefficients are significant
+
+```{r}
+# Fit the ARMA(5,5) model
+arma_model <- arima(ts_data, order = c(p_aic, 0, q_aic))
+
+# Calculate t-values and p-values in a compact way
+results <- data.frame(
+  Coefficient = coef(arma_model),
+  Std_Error = sqrt(diag(arma_model$var.coef)),
+  t_value = coef(arma_model) / sqrt(diag(arma_model$var.coef))
+) %>%
+  transform(p_value = 2 * (1 - pnorm(abs(t_value))))
+
+# Print the results
+print(results)
+```
+
+**RMSE**
+
+```{r}
+# Búsqueda exhaustiva de p y q para minimizar RMSE
+find_best_pq_rmse <- function(ts_data, max_p = 5, max_q = 5) {
+  best_rmse <- 200
+  best_p <- NULL
+  best_q <- NULL
+  ts_data_zoo <- as.zoo(ts_data)
+  
+  for (p in 0:max_p) {
+    for (q in 0:max_q) {
+        model <- arima(ts_data_zoo, order = c(p, 0, q))
+        fitted_values <- as.zoo(fitted(model))
+        index(fitted_values) <- as.Date(index(ts_data)) # For data inconsistencies
+        rmse_val <- rmse(ts_data_zoo, fitted_values)
+        
+        if (any(is.na(ts_data)) | any(is.na(fitted_values))) {
+          print("NA values") # Si hay NA, omitir esta iteración
+        }
+        
+        # Actualizar si encontramos un RMSE menor
+        if (!is.na(rmse_val) && rmse_val < best_rmse) {
+          best_rmse <- rmse_val
+          best_p <- p
+          best_q <- q
+        }
+    }
+  }
+  
+  # Retornar los mejores valores de p, q y el RMSE
+  list(
+    best_p = best_p,
+    best_q = best_q,
+    best_rmse = best_rmse
+  )
+}
+
+# Usar la función para encontrar la mejor combinación de p y q
+result <- find_best_pq_rmse(ts_ret, max_p = 3, max_q = 3)
+
+# Mostrar los resultados
+cat("Best ARMA Model: ARMA(", result$best_p, ",", result$best_q, ")\n")
+cat("RMSE of RMSE omdel: ", result$best_rmse)
+```
+
+```{r}
+# Ahora ajustamos el modelo ARIMA con los mejores p y q
+best_rmse_model <- arima(ts_ret, order = c(result$best_p, 0, result$best_q))
+
+# Obtener los valores ajustados (fitted values) del mejor modelo
+fitted_values_best <- fitted(best_rmse_model)
+
+# Crear un data frame con los datos originales y ajustados
+df_plot_best <- data.frame(
+  Date = index(ts_ret),
+  Original = coredata(ts_ret),
+  Fitted = coredata(fitted_values_best)
+)
+
+# Graficar la serie temporal original y los valores ajustados del mejor modelo ARIMA
+ggplot(df_plot_best, aes(x = Date)) +
+  geom_line(aes(y = Original, color = "Original")) +  # Serie original
+  geom_line(aes(y = Fitted, color = "Fitted"), linetype = "dashed") +  # Valores ajustados
+  labs(title = paste("ARIMA Model (RMSE) Adjusted by p =", result$best_p, "and q =", result$best_q),
+       x = "Dates",
+       y = "Values",
+       color = "Series") +
+  theme_minimal()
+```
+
+```{r}
+# Fit the ARMA(5, 5) model
+arma_model <- arima(ts_data, order = c(result$best_p, 0, result$best_q))
+
+# Calculate p-values directly
+results <- data.frame(
+  Coefficient = coef(arma_model),
+  p_value = 2 * (1 - pnorm(abs(coef(arma_model) / sqrt(diag(arma_model$var.coef)))))
+)
+
+# Print the results
+print(results)
+```
+
+**Plot acf and pacf correlograms**
+
+```{r}
+acf(as.vector(ts_ret),main="ACF of Stock Returns"); 
+```
+
+```{r}
+pacf(as.vector(ts_ret),main="PACF of Stock Returns")
+```
+
+## 8. Look for normality and homoskedasticity of residuals
+
+**First, let´s check normality of residuals**
+
+```{r}
+# AIC model
+best_aic_model <- auto.arima(ts_ret) 
+
+# Obtener los residuos del modelo
+aic_residuals <- residuals(best_aic_model)
+
+# Graficar el histograma de los residuos
+hist(aic_residuals, main = "AIC Residuals Histogram", xlab = "Residuos", breaks = 20)
+
+# Graficar el Q-Q plot de los residuos
+qqnorm(aic_residuals)
+qqline(aic_residuals, col = "red")  # Agregar la línea de referencia normal
+
+shapiro.test(aic_residuals) # If lower than 0.05, then reject normality
+```
+
+```{r}
+# RMSE model
+best_rmse_model <- arima(ts_ret, order = c(result$best_p, 0, result$best_q))
+
+# Obtener los residuos del modelo
+rmse_residuals <- residuals(best_rmse_model)
+
+# Graficar el histograma de los residuos
+hist(rmse_residuals, main = "RMSE Residuals Histogram", xlab = "Residuos", breaks = 20)
+
+# Graficar el Q-Q plot de los residuos
+qqnorm(rmse_residuals)
+qqline(rmse_residuals, col = "red")  # Agregar la línea de referencia normal
+
+shapiro.test(rmse_residuals) # If lower than 0.05, then reject normality
+```
+
+**Now, let´s check homoskedasticity**
+
+```{r}
+# AIC
+
+# Graficar los residuos a lo largo del tiempo
+plot(index(ts_ret), aic_residuals, type = "l", main = "AIC Residuals vs Time", ylab = "Residuals", xlab = "Date")
+
+# Perform the Breusch-Pagan test
+bp_test <- bptest(aic_residuals ~ fitted(best_aic_model))
+
+# Print the p-value
+print(paste("P-value from Breusch-Pagan Test:", bp_test$p.value))
+
+# Evaluate the p-value to determine heteroscedasticity
+if (bp_test$p.value < 0.05) {
+  print("The residuals are heteroscedastic (we reject the null hypothesis of homoscedasticity).")
+} else {
+  print("There is no sufficient evidence to reject homoscedasticity (residuals are homoscedastic).")
+}
+```
+
+```{r}
+# RMSE
+
+# Graficar los residuos a lo largo del tiempo
+plot(index(ts_ret), rmse_residuals, type = "l", main = "RMSE Residuals vs Time", ylab = "Residuals", xlab = "Date")
+
+# Perform the Breusch-Pagan test
+bp_test <- bptest(rmse_residuals ~ fitted(best_rmse_model))
+
+# Print the p-value
+print(paste("P-value from Breusch-Pagan Test:", bp_test$p.value))
+
+# Evaluate the p-value to determine heteroscedasticity
+if (bp_test$p.value < 0.05) {
+  print("The residuals are heteroscedastic (we reject the null hypothesis of homoscedasticity).")
+} else {
+  print("There is no sufficient evidence to reject homoscedasticity (residuals are homoscedastic).")
+}
+```
+
+## 9. ARCH / GARCH Effects
+
+<https://users.metu.edu.tr/ozancan/ARCHGARCHTutorial.html>
+
+1.  **Look for presence of ARCH effects**
+
+```{r}
+# AIC
+archTest(aic_residuals)
+# Since p values is less than 0.05, we reject Ho. Therefore, we can conclude the presence of ARCH effects
+```
+
+2.  **Check heteroskedasticity (i.e., constant variance in errors).**
+
+```{r}
+rmse_rr=rmse_residuals^2
+par(mfrow=c(1,2))
+acf(as.vector(rmse_rr),main="ACF of Squared Residuals (RMSE)"); 
+pacf(as.vector(rmse_rr),main="PACF of Squared Residuals (RMSE)")
+```
+
+```{r}
+aic_rr=aic_residuals^2
+par(mfrow=c(1,2))
+acf(as.vector(aic_rr),main="ACF of Squared Residuals (AIC)"); 
+pacf(as.vector(aic_rr),main="PACF of Squared Residuals (AIC)")
+```
+
+3.  **After visual representation on variability of variance of the residuals, we need to perform the formal test.**
+
+Important sections to check are the following:
+
+-   **Estimated parameters for GARCH and ARCH**. Need to look at whether coefficients are signficant or not (by looking at their p-values). Important: **might consider incorporating more lags if by looking at acf and pacf** we consider so.
+
+-   **Ljung Box Tests**. Test autocorrelation among the residuals (null is no autocorrelation). If we reject the null, then residuals are autocorrelated. Tests are also performed for squared residuals.
+
+-   **ARCH LM Test.** Checks presence of ARCH effect (null is that it is an adequately fitted ARCH process).
+
+-   **Sign Bias Test.** Used to test leverage effect in the standardized residuals. (Null: no significiant negative and positive reaction shocks (if exist apARCH type models))(?)
+
+-   **Nyblom stability test**. Tests for structural changes within a time series (null: parameter values are constant). If we reject, then we might have to consider TGARCH models.
+
+-   **Adjusted Pearson Goodness-of-Fit Test.** Compares empirical distribution of residuals with theoretical one (i.e., checks if residuals are normal, for instance).
+
+```{r}
+# start with default GARCH spec.
+spec = ugarchspec() #the empty function specifies the default model. 
+def.fit = ugarchfit(spec = spec, data = ts_ret)
+print(def.fit)
+```
+
+```{r}
+# Step 1: Specify a GARCH(5, 5) model with ARMA(0, 0) for simplicity (change ARMA terms if needed)
+spec_garch55 <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(5, 5)),
+  mean.model = list(armaOrder = c(5, 5), include.mean = TRUE),
+  distribution.model = "norm"  # Assume normal distribution for innovations
+)
+
+# Step 2: Fit the GARCH(5, 5) model to your time series data
+fit_garch55 <- ugarchfit(spec = spec_garch55, data = ts_ret)
+
+# Print the model fit summary (this will include the Weighted Ljung-Box Test)
+print(fit_garch55)
+```
+
+**Estimated parameters**
+
+In this case, the test states that GARCH should be (1, 1). However, by looking at the acf and pacf plots we will consider additional options.
+
+```{r}
+# Function to fit ARMA(5,5)-GARCH(r,s) and select the best model
+find_best_garch_model <- function(data, max_r = 5, max_s = 5) {
+  
+  best_aic <- Inf
+  best_r <- NULL
+  best_s <- NULL
+  best_model <- NULL
+  
+  # Loop over different combinations of r and s
+  for (r in 0:max_r) {
+    for (s in 0:max_s) {
+      # Specify GARCH(r, s) model with ARMA(5, 5) for the mean equation
+      spec <- ugarchspec(
+        variance.model = list(model = "sGARCH", garchOrder = c(r, s)),
+        mean.model = list(armaOrder = c(5, 5), include.mean = TRUE),
+        distribution.model = "norm"
+      )
+      
+      # Fit the GARCH model with hybrid solver and more iterations
+      fit <- tryCatch(
+        ugarchfit(spec = spec, data = data, solver = "hybrid", solver.control = list(maxit = 10000)),
+        error = function(e) NULL  # Handle errors gracefully
+      )
+      
+      # Check if the model was fitted successfully
+      if (!is.null(fit)) {
+        # Extract AIC
+        aic_val <- tryCatch(infocriteria(fit)[1], error = function(e) Inf) 
+        if (aic_val < best_aic ) {
+          best_aic <- aic_val
+          best_r <- r
+          best_s <- s
+          best_model <- fit
+          }
+        }
+      }
+    }
+  
+  # Return the best GARCH model and its parameters
+  list(best_r = best_r, best_s = best_s, best_aic = best_aic, best_model = best_model)
+}
+
+# Use your data (replace ts_data with your actual time series data)
+result <- find_best_garch_model(ts_ret)
+```
+
+```{r}
+# Function to fit ARMA(5,5)-GARCH(r,s) and select the best model
+find_best_garch_model_rmse <- function(data, max_r = 5, max_s = 5) {
+  
+  best_rmse <- Inf
+  best_r <- NULL
+  best_s <- NULL
+  best_model <- NULL
+  
+  # Loop over different combinations of r and s
+  for (r in 0:max_r) {
+    for (s in 0:max_s) {
+      # Specify GARCH(r, s) model with ARMA(5, 5) for the mean equation
+      spec <- ugarchspec(
+        variance.model = list(model = "sGARCH", garchOrder = c(r, s)),
+        mean.model = list(armaOrder = c(5, 5), include.mean = TRUE),
+        distribution.model = "norm"
+      )
+      
+      # Fit the GARCH model with hybrid solver and more iterations
+      fit <- tryCatch(
+        ugarchfit(spec = spec, data = data, solver = "hybrid", solver.control = list(maxit = 10000)),
+        error = function(e) NULL  # Handle errors gracefully
+      )
+      
+      # Check if the model was fitted successfully
+      if (!is.null(fit)) {
+        # Extract AIC
+        fitted_values <- tryCatch(fitted(fit), error = function(e) NULL)
+        if (!is.null(fitted_values)) {
+          rmse_val <- tryCatch(rmse(coredata(data), fitted_values), error = function(e) Inf)
+        
+        if (rmse_val < best_rmse) {
+          best_rmse <- rmse_val
+          best_r <- r
+          best_s <- s
+          best_model <- fit
+          }
+        }
+      }
+    }
+  }
+  
+  # Return the best GARCH model and its parameters
+  list(best_r = best_r, best_s = best_s, best_rmse = best_rmse, best_model = best_model)
+}
+
+# Use your data (replace ts_data with your actual time series data)
+result_rmse <- find_best_garch_model_rmse(ts_ret)
+```
+
+```{r}
+# Print the best GARCH model parameters and AIC/RMSE
+cat("Best GARCH Model: GARCH(", result_rmse$best_r, ",", result$best_s, ")\n")
+cat("Best RMSE: ", result_rmse$best_rmse, "\n")
+```
+
+**Ljung Box Test**
+
+-   P-values very low: serial correlation of the residuals
+
+-   No serial correlation for squared residuals
+
+**Goodness-of-fit**
+
+-   **Reject normality**: residuals are not normally distributed
+
+**Nyblom Stability test**
+
+-   Reject constant behavior of residuals
+
+## 10. Predict within reasonable time window
+
+```{r}
+n <- length(ts_ret)
+train_size <- 0.8
+train_index <- floor(train_size * n)
+
+ts_train <- ts_ret[1:train_index]
+ts_test <- ts_ret[(train_index + 1):n]
+
+# result <- analyze_time_series(ts_ret)
+```
+
+```{r}
+train_index
+```
+
+```{r}
+
+# 2. Define the GARCH model specification using the best (p, q) and (r, s) orders
+spec <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(result$r, result$s)),
+  mean.model = list(armaOrder = c(result$p, result$q), include.mean = TRUE),
+  distribution.model = "norm"
+)
+
+fit <- tryCatch(
+    ugarchfit(spec = spec, data = ts_train),
+    error = function(e) NULL
+  )
+  
+if (is.null(fit)) {
+  stop("Model fitting failed.")
+}
+```
+
+We will check that predictions are correct for first day
+
+```{r}
+forecast <- ugarchforecast(fit, n.ahead = 1)
+forecast
+```
+
+For the second day, we must append one data point to the training set
+
+```{r}
+ts_train_window <- ts_ret[1:(train_index + 1)]
+
+fit2 <- tryCatch(
+    ugarchfit(spec = spec, data = ts_train_window),
+    error = function(e) NULL
+  )
+  
+if (is.null(fit)) {
+  stop("Model fitting failed.")
+}
+
+forecast <- ugarchforecast(fit2, n.ahead = 1)
+forecast
+```
+
+## 11. Generate dataframe with significant columns
+
+```{r}
+# Printing the ARMA(1, 0) GARCH(2, 0) model equation
+cat("Theoretical Equation for ARMA(1, 0) GARCH(2, 0) process:\n\n")
+
+cat("Mean equation (ARMA part):\n")
+cat("X_t = mu + phi_1 * X_(t-1) + epsilon_t\n")
+
+cat("Variance equation (GARCH part):\n")
+cat("sigma_t^2 = alpha_0 + alpha_1 * epsilon_(t-1)^2 + alpha_2 * epsilon_(t-2)^2\n")
+
+cat("\nWhere:\n")
+cat("- mu is the mean (intercept)\n")
+cat("- phi_1 is the AR(1) coefficient\n")
+cat("- alpha_0 is the constant term in the GARCH model\n")
+cat("- alpha_1 and alpha_2 are the GARCH coefficients\n")
+cat("- epsilon_t is the error term, and sigma_t^2 is the conditional variance\n")
+```
+
+```{r}
+hola <- generate_var_res_dataframe(ts_ret, result$p, result$q, result$r, result$s)
+```
+
+Check that dataframe was correctly generated
+
+```{r}
+returns1 <- coredata(head(ts_ret, 99))
+
+var(coredata(head(ts_ret, 99)))
+```
+
+```{r}
+
+generate_lagged_df <- function(df, p, q, r, s) {
+  
+  # Initialize a new dataframe with just the 'Date' column
+  new_df <- data.frame(Date = df$Date, Returns = df$Returns)
+  
+  for (i in 1:p) {
+    new_df[[paste0("Lag_Returns_", i)]] <- dplyr::lag(df$Returns, i)
+  }
+  
+  # Add the 'Residuals' column and q lagged 'Residuals' columns
+  new_df$Residuals <- df$Residuals
+  for (i in 1:q) {
+    new_df[[paste0("Lag_Residuals_", i)]] <- dplyr::lag(df$Residuals, i)
+  }
+  
+  # Add the 'Variance' column and r lagged 'Variance' columns
+  new_df$Variance <- df$Variance
+  for (i in 1:r) {
+    new_df[[paste0("Lag_Variance_", i)]] <- dplyr::lag(df$Variance, i)
+  }
+  
+  # Add the 'Squared_Residuals' column and s lagged 'Squared_Residuals' columns
+  new_df$Squared_Residuals <- df$Squared_Residuals
+  for (i in 1:s) {
+    new_df[[paste0("Lag_Squared_Residuals_", i)]] <- dplyr::lag(df$Squared_Residuals, i)
+  }
+  
+  # Return the dataframe
+  return(new_df)
+}
+
+# Example usage with a dataframe 'df'
+new_df <- generate_lagged_df(hola, p = 3, q = 2, r = 1, s = 2)
+
+```
