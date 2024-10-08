@@ -1,7 +1,7 @@
 
 evaluate_direction_accuracy <- function(ts_data, predictions, train_index, p, q, r, s) {
   
-  test_length <- length(ts_ret) - prediction_result$train_index
+  test_length <- length(ts_data) - prediction_result$train_index
   realized_values <- tail(ts_data, test_length)
   
   # Ensure both inputs are numeric vectors and of the same length
@@ -28,5 +28,13 @@ evaluate_direction_accuracy <- function(ts_data, predictions, train_index, p, q,
 # Assuming prediction_result$predictions contains your predicted values
 # and prediction_result$actual contains the actual stock prices
 
-accuracy <- evaluate_direction_accuracy(ts_ret, prediction_result$predictions, prediction_result$train_index, 
-                                        p = result$p, q = result$q, r = result$r, s = result$s)
+# Assuming ts_ret is your time series data and you have obtained p, q, r, s from your model
+# prediction_result <- evaluate_garch_model(ts_ret, p = best_p, q = best_q, r = best_r, s = best_s)
+
+# View the rolling predictions and RMSE
+# prediction_result$predictions
+# prediction_result$rmse
+# prediction_result$train_index
+
+# test_length <- length(ts_ret) - prediction_result$train_index
+
