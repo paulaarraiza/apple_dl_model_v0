@@ -8,7 +8,7 @@ generate_var_res_dataframe <- function(ts_data, p, q, r, s) {
   )
   
   n <- length(ts_data)
-  first_index <- 100  # +1 because we need to start in the next time step
+  first_index <- 101  # +1 because we need to start in the next time step
   returns <- coredata(ts_data)
   
   # Initialize data frame
@@ -72,7 +72,6 @@ generate_var_res_dataframe <- function(ts_data, p, q, r, s) {
   return(df)
 }
 
-variables_df <- generate_var_res_dataframe(ts_ret, result$p, result$q, result$r, result$s)
 
 generate_lagged_df <- function(df, p, q, r, s) {
   
@@ -105,5 +104,5 @@ generate_lagged_df <- function(df, p, q, r, s) {
   return(new_df)
 }
 
-# Example usage with a dataframe 'df'
-output_df <- generate_lagged_df(variables_df, result$p, result$q, result$r, result$s)
+
+
