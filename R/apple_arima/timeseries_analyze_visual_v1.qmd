@@ -1,0 +1,569 @@
+---
+title: "timeseries_analyze_visual_v1"
+format: html
+editor: visual
+---
+
+# 0. Load libraries
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(psych)
+library(forecast)
+library(zoo)
+library(tseries)
+library(Metrics)
+library(tidyr)
+library(lmtest)
+library(FinTS)
+library(rugarch)
+library(rmgarch)
+library(MTS)
+library(gridExtra)
+library(reshape2)
+```
+
+```{r}
+# In case we want to delete environment
+rm(list =ls())
+setwd("/Users/paulaarraizaarias/Documents/ucm/tfg/matematicas/git/R/apple_arima/")
+```
+
+# 1. Generate df
+
+## Function
+
+```{r}
+generate_ts <- function(df) {
+  
+  # Step 1: Select the necessary columns and format the date
+  df <- df[c("Date", "Close")]
+  df$Date <- as.Date(df$Date)
+  
+  # Step 2: Generate df with returns instead of raw prices
+  df_ret <- df %>%
+    mutate(Return = (Close / lag(Close) - 1))
+  
+  # Step 3: Delete the first row (no return for first observation) and Price column
+  df_ret <- df_ret[-1, ]  # Remove first row with NA in 'Return'
+  df_ret$Return <- df_ret$Return*100
+  
+  # Step 5: Create time series objects
+  ts_data <- zoo(df_ret$Return, order.by = df_ret$Date)
+  
+  # Step 6: Create regular date sequence for interpolation
+  all_dates_ret <- seq(min(df_ret$Date), max(df_ret$Date), by = "day")
+  
+  # Step 7: Merge the time series with regular date sequence and interpolate missing values
+  ts <- merge(ts_data, zoo(, all_dates_ret))
+  ts <- na.approx(ts)  # Interpolate missing values for returns
+  
+  # Step 8: Create data frames for the time series (optional)
+  df_full_ret <- data.frame(Date = index(ts), Return = coredata(ts))
+  
+  # Step 9: Plot the returns with ggplot2 and save the plot
+  plot_returns <- ggplot(df_full_ret, aes(x = Date, y = Return)) +
+    geom_line(color = "blue") +
+    geom_hline(aes(yintercept = mean(Return)), linetype = "dashed", color = "red") +
+    labs(title = "AAPL Daily Returns", x = "Date", y = "Return") +
+    theme_minimal() + 
+    theme(
+      panel.background = element_rect(fill = "white", color = NA),  # Set panel background to white
+      plot.background = element_rect(fill = "white", color = NA),   # Set plot background to white
+      panel.grid.major = element_line(color = "grey90"),            # Optional: customize grid lines
+      panel.grid.minor = element_blank() 
+    )
+    
+  # Save the ggplot plot
+  ggsave("plots/aapl_daily_returns.png", plot = plot_returns, width = 8, height = 6)
+  # Return the interpolated returns time series
+  return(ts)
+}
+```
+
+## Execute
+
+```{r}
+# 1. Load data and obtain df
+df <- read.csv("data/apple_2y.csv")
+ts_ret <- generate_ts(df)
+
+# Also separate train and test data
+train_size <- 0.8
+n <- length(ts_ret)
+train_index <- floor(train_size * n)
+ts_train <- ts_ret[1:train_index]
+ts_test <- ts_ret[(train_index + 1):n]
+
+cat("Training on first", length(ts_train), "observations.\n")
+cat("Testing on remaining", length(ts_test), "observations.\n")
+```
+
+# 2. Generate df
+
+## Function
+
+```{r}
+calculate_p_values <- function(arima_model) {
+  coefs <- arima_model$coef
+  std_errors <- sqrt(diag(vcov(arima_model)))
+  t_values <- coefs / std_errors
+  p_values <- 2 * (1 - pnorm(abs(t_values)))
+  return(p_values)
+}
+```
+
+```{r}
+select_best_arima_model <- function(ts, max_p, max_d, max_q, threshold = 0.7) {
+  # Initialize a data frame to store results
+  results <- data.frame(
+    Model = character(),
+    Proportion = numeric(),
+    AIC = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  for (p in 0:max_p) {
+    for (d in 0:max_d) {
+      for (q in 0:max_q) {
+        model <- tryCatch({
+          arima(ts, order = c(p, d, q), method = "CSS-ML")
+        }, warning = function(w) {
+          message("Warning: ", w)  
+          return(NULL)
+        }, error = function(e) {
+          message("Error: ", e)  
+          return(NULL)
+        })
+        
+        if (is.null(model)) next
+        
+        p_values <- calculate_p_values(model)
+        prop <- mean(p_values <= 0.05, na.rm = TRUE)
+        aic_value <- AIC(model)
+        arima_model_str <- paste0("ARIMA(", p, ",", d, ",", q, ")")
+        cat("ARIMA(", p, ",", d, ",", q, ") - Proportion p-values:", prop, "- AIC:", aic_value, "\n")
+        results <- rbind(
+          results,
+          data.frame(Model = arima_model_str, Proportion = prop, AIC = aic_value)
+        )}}}
+  filtered_results <- results %>% filter(Proportion > threshold)
+  best_model <- filtered_results[which.min(filtered_results$AIC), ]
+  list(
+    results = results,
+    best_model = best_model
+  )
+}
+```
+
+```{r}
+choose_best_garch <- function(ts, p, q, max_r, max_s, garch_threshold = 0.6) {
+  
+  # Inicializar variables para almacenar el mejor modelo y el AIC más bajo
+  best_aic <- Inf
+  best_model <- NULL
+  best_r <- 0
+  best_s <- 0
+  
+  # Iterar sobre las combinaciones de r (p para GARCH) y s (q para ARCH)
+  for (r in 0:max_r) {
+    for (s in 0:max_s) {
+      # Definir la especificación del modelo GARCH-ARMA
+      spec <- ugarchspec(
+        variance.model = list(model = "sGARCH", garchOrder = c(r, s)),
+        mean.model = list(armaOrder = c(p, q), include.mean = TRUE),
+        distribution.model = "norm"
+      )
+      
+      # Ajustar el modelo GARCH-ARMA
+      fit <- tryCatch({
+        ugarchfit(spec = spec, data = ts, solver = "hybrid")
+      }, error = function(e) {
+        cat("Error en el ajuste para GARCH(", r, ",", s, "):", e$message, "\n")
+        return(NULL)
+      })
+      
+      # Si el ajuste fue exitoso, calcular los p-valores y el AIC
+      if (!is.null(fit)) {
+        fit_summary <- fit@fit$matcoef
+        
+        # Extraer coeficientes y errores estándar
+        coefficients <- fit_summary[, 1]
+        std_errors <- fit_summary[, 2]
+        
+        # Calcular valores Z y p-valores
+        z_values <- coefficients / std_errors
+        p_values <- 2 * (1 - pnorm(abs(z_values)))
+        
+        # Calcular la proporción de p-valores <= 0.05
+        prop_pvalues <- mean(p_values <= 0.05)
+        
+        # Calcular el AIC
+        aic_value <- infocriteria(fit)["Akaike", 1]
+        
+        # Filtrar por la proporción de p-valores mayor a 0.66
+        if (prop_pvalues > garch_threshold) {
+          # Comparar el AIC con el mejor AIC encontrado hasta ahora
+          if (!is.na(aic_value) && aic_value < best_aic) {
+            best_aic <- aic_value
+            best_model <- fit
+            best_r <- r
+            best_s <- s
+          }
+        } 
+        # Imprimir el progreso
+        cat("GARCH(", r, ",", s, ") - Proportion p-values:", prop_pvalues, "- AIC:", aic_value, "\n")
+      }
+    }
+  }
+  
+  # Imprimir el mejor modelo encontrado
+  if (!is.null(best_model)) {
+    cat("Best GARCH(", best_r, ",", best_s, ") con AIC:", best_aic, "\n")
+  } else {
+    print("Threshold was too restrictive")
+    }
+  
+  # Devolver el mejor modelo y su AIC
+  return(list(best_model = best_model, best_aic = best_aic, best_r = best_r, best_s = best_s))
+}
+```
+
+```{r}
+analyze_time_series <- function(ts, max_p, max_d, max_q, max_r, max_s, garch_threshold = 0.6) {
+  
+  # 1. If stationary, continue. Plot ACF and PACF
+  png("plots/acf_pacf_returns.png", width = 800, height = 400)
+  par(mfrow = c(1, 2))  # Set plotting area to show ACF and PACF side by side
+  acf(ts, main = "ACF of Returns", lag.max = 20)
+  pacf(ts, main = "PACF of Returns", lag.max = 20)
+  dev.off()
+  
+  # 2. Fit ARIMA model
+  output <- select_best_arima_model(ts, max_p, max_d, max_q)
+  best_model_text <- output$best_model["Model"]
+  best_model_params <- scan(text = gsub("ARIMA\\(|\\)", "", best_model_text), sep = ",", quiet = TRUE) 
+  best_p <- best_model_params[1]
+  best_d <- best_model_params[2]
+  best_q <- best_model_params[3]
+  cat("Best ARIMA model: ARIMA(", best_p, ",", best_d, ",", best_q, ")\n")
+  
+  best_model <- arima(ts, order = c(best_p, best_d, best_q))
+  # 3. Test for ARCH effects
+  residuals <- residuals(best_model)
+  arch_test <- capture.output(archTest(residuals))
+  
+  first_p_value <- as.numeric(sub(".*p-value: ", "", arch_test[grep("Rank-based Test", arch_test) + 1]))
+  second_p_value <- as.numeric(sub(".*p-value: ", "", arch_test[grep("Rank-based Test", arch_test) + 1]))
+  p_values <- c(first_p_value, second_p_value)
+  
+  if (any(p_values < 0.05)) {
+    print("ARCH effects detected")
+    
+    # Plot ACF and PACF of squared residuals
+    png("plots/acf_pacf_sq_residuals.png", width = 800, height = 400)
+    par(mfrow = c(1, 2))
+    acf(residuals^2, main = "ACF of Squared Residuals")
+    pacf(residuals^2, main = "PACF of Squared Residuals")
+    dev.off()
+  } else {
+    cat("No ARCH effects detected (p-value =", arch_test$p.value, ")\n")
+  }
+  
+  # 4. Automatically detect best GARCH(p, q) orders
+  garch_result <- choose_best_garch(ts, best_p, best_q, max_r, max_s, garch_threshold = 0.6)
+  best_r <- garch_result$best_r
+  best_s <- garch_result$best_s
+  best_garch_model <- garch_result$best_model
+  garch_residuals <- residuals(best_garch_model)
+  
+  cat("Best GARCH order: GARCH(", best_r, ",", best_s, ")\n")
+  
+  # 5. Fit GARCH model with detected orders to check normality and heteroskedasticity
+  spec_garch <- ugarchspec(
+    variance.model = list(model = "sGARCH", garchOrder = c(best_r, best_s)),
+    mean.model = list(armaOrder = c(best_p, best_q), include.mean = TRUE),
+    distribution.model = "norm"
+  )
+  
+  fit_garch <- ugarchfit(spec = spec_garch, data = ts)
+  
+  # Normality
+  ks_result <- ks.test(garch_residuals, "pnorm", mean = mean(garch_residuals), sd = sd(garch_residuals))
+  if (ks_result$p.value<0.05) {
+    print("Residuals are not normal")
+  } else {
+    print("Residuals are normal")
+  }
+  
+  # Heteroskedasticity
+  bp_test <- bptest(garch_residuals ~ fitted(best_garch_model))
+  if (bp_test$p.value < 0.05) {
+    print("Residuals are heteroscedastic.")
+  } else {
+    print("Residuals are homoscedastic.")
+  }
+  
+  # 8. Return the ARMA(p, q) and GARCH(r, s) parameters
+  return(list(p = best_p, q = best_q, r = best_r, s = best_s))
+}
+```
+
+## Execute
+
+```{r}
+arima_result <- analyze_time_series(ts_train, max_p=3, max_d=0, max_q=3, max_r=3, max_s=3, garch_threshold = 0.6)
+best_p <- arima_result$p
+best_q <- arima_result$q
+best_r <- arima_result$r
+best_s <- arima_result$s
+```
+
+# 3. Generate predictions
+
+## Function
+
+```{r}
+evaluate_garch_model <- function(ts_data, p, q, r, s, train_size = 0.8) {
+  
+  # 1. Split data into train (80%) and test (20%)
+  n <- length(ts_data)
+  train_index <- floor(train_size * n)
+  
+  ts_train <- ts_data[1:train_index]
+  ts_test <- ts_data[(train_index + 1):n]
+  
+  cat("Training on first", length(ts_train), "observations.\n")
+  cat("Testing on remaining", length(ts_test), "observations.\n")
+  
+  # 2. Define the GARCH model specification using the best (p, q) and (r, s) orders
+  spec <- ugarchspec(
+    variance.model = list(model = "sGARCH", garchOrder = c(r, s)),
+    mean.model = list(armaOrder = c(p, q), include.mean = TRUE),
+    distribution.model = "norm"
+  )
+  
+  # 3. Perform rolling predictions on the test set by re-fitting the model at each step
+  rolling_predictions <- numeric(length(ts_test))
+  
+  for (i in seq_along(ts_test)) {
+    # Incrementally increase the size of the training data with each new observation from the test set
+    ts_train_window <- ts_data[1:(train_index + i-1)]
+    
+    # Fit the GARCH model to the updated training window
+    fit <- tryCatch(
+      ugarchfit(spec = spec, data = ts_train_window, solver = "hybrid"),
+      error = function(e) NULL
+    )
+    
+    # If the model was successfully fitted, predict the next value
+    if (!is.null(fit)) {
+      forecast <- ugarchforecast(fit, n.ahead = 1)
+      rolling_predictions[i] <- fitted(forecast)
+    } else {
+      rolling_predictions[i] <- NA  # If fitting failed, return NA
+    }
+  }
+  
+  # 4. Evaluate the model using RMSE (or any other metric)
+  actual_values <- ts_test
+  rmse <- sqrt(mean((rolling_predictions - actual_values)^2, na.rm = TRUE))
+  
+  cat("Rolling RMSE: ", rmse, "\n")
+  
+  # Return the rolling predictions and RMSE
+  return(list(predictions = rolling_predictions, rmse = rmse, train_index = train_index))
+}
+```
+
+## Execute
+
+```{r}
+prediction_result <- evaluate_garch_model(ts_ret, p = best_p, q = best_q, r = best_r, s = best_s)
+    
+# View the rolling predictions and RMSE
+# prediction_result$predictions
+# prediction_result$rmse
+# prediction_result$train_index
+test_length <- length(ts_ret) - prediction_result$train_index
+
+# Plot Actual vs Predicted Returns
+df <- data.frame(
+  Time = seq(1, test_length),
+  Actual = coredata(tail(ts_ret, test_length)),
+  Predicted = prediction_result$predictions
+)
+ggplot_obj <- ggplot(df, aes(x = Time)) +
+  geom_line(aes(y = Actual, color = "Actual")) +
+  geom_line(aes(y = Predicted, color = "Predicted"), linetype = "dashed") +
+  labs(title = "Actual vs Predicted Returns", x = "Time", y = "Returns") +
+  theme_minimal() +
+  scale_color_manual("", values = c("Actual" = "blue", "Predicted" = "red"))
+ggsave(filename = "plots/actual_vs_predicted.png", plot = ggplot_obj, width = 8, height = 6)
+```
+
+# 4. Evaluate predictions
+
+## Function
+
+```{r}
+evaluate_direction_accuracy <- function(ts_data, predictions, train_index, p, q, r, s) {
+  
+  test_length <- length(ts_data) - prediction_result$train_index
+  realized_values <- tail(ts_data, test_length)
+  
+  # Ensure both inputs are numeric vectors and of the same length
+  if (length(predictions) != length(realized_values)) {
+    stop("Predictions and actual values must have the same length.")
+  }
+  
+  # Create a data frame with actual, predicted, and a column 'Correct'
+  df <- data.frame(
+    Realized = realized_values,
+    Predicted = predictions,
+    Correct = ifelse(realized_values*predictions >= 0, 1, 0)  # Assign 1 if both are > 0, else 0
+  )
+  
+  # Calculate the proportion of correct predictions (sum of 1's divided by the number of rows)
+  accuracy <- sum(df$Correct) / nrow(df)
+  cat("Proportion of correct direction predictions:", accuracy, "\n")
+  
+  # Return the accuracy
+  return(list(df = df, accuracy = accuracy))
+}
+```
+
+## Execute
+
+```{r}
+accuracy <- evaluate_direction_accuracy(
+  ts_ret, prediction_result$predictions, prediction_result$train_index, 
+  p = best_p, q = best_q, r = best_r, s = best_s)
+
+filename <- paste0("predictions/apple_garch_p", best_p, "_q", best_q, "_r", best_r, "_s", best_s, ".csv")
+write.csv(accuracy$df, filename, row.names = FALSE)
+```
+
+# 5. Generate output df
+
+## Function
+
+```{r}
+generate_var_res_dataframe <- function(ts_data, p, q, r, s) {
+  
+  # Fit the ARMA(p, q) - GARCH(r, s) model to the time series
+  spec <- ugarchspec(
+    variance.model = list(model = "sGARCH", garchOrder = c(r, s)),
+    mean.model = list(armaOrder = c(p, q), include.mean = TRUE),
+    distribution.model = "norm"
+  )
+  
+  n <- length(ts_data)
+  first_index <- 101  # +1 because we need to start in the next time step
+  returns <- coredata(ts_data)
+  
+  # Initialize data frame
+  df <- data.frame(
+    Date = index(ts_data),
+    Returns = returns
+  )
+  
+  # Initialize columns for residuals and variances
+  df$Variance <- rep(NA, n)
+  df$Residuals <- rep(NA, n)
+  df$Squared_Residuals <- rep(NA, n)
+  
+  # Initialize a progress bar
+  pb <- txtProgressBar(min = first_index, max = n, style = 3)
+  
+  # When there are no lags available
+  for (i in 2:first_index-1) {
+    # Obtain variance when there are fewer data points available
+    ts_window <- ts_data[1:(i-1)]
+    variance_window <- var(coredata(ts_window))
+    df$Variance[i] <- variance_window
+  }
+  
+  # When all lags are available
+  for (i in first_index:n) {
+    ts_window <- ts_data[1:(i-1)]
+    variance_window <- var(coredata(ts_window))
+    df$Variance[i] <- variance_window  # Assign variance from the model
+    
+    fit <- tryCatch(
+      ugarchfit(spec = spec, data = ts_window, solver = "hybrid"),
+      error = function(e) NULL
+    )
+    
+    # Only proceed if fit is successful
+    if (!is.null(fit)) {
+      residuals_fit <- residuals(fit)
+      
+      # Check if residuals were successfully extracted
+      if (length(residuals_fit) > 0) {
+        residuals2_fit <- residuals_fit[length(residuals_fit)]^2  # Take the last residual and square it
+        
+        # Assign values to columns
+        df$Residuals[i] <- residuals_fit[length(residuals_fit)]  # Assign last residual
+        df$Squared_Residuals[i] <- residuals2_fit  # Assign squared residual
+      }
+    } else {
+      # Handle cases where the fit fails by keeping NA in the dataframe
+      df$Residuals[i] <- NA
+      df$Squared_Residuals[i] <- NA
+    }
+    
+    # Update the progress bar after each iteration
+    setTxtProgressBar(pb, i)
+  }
+  
+  # Close the progress bar
+  close(pb)
+  
+  return(df)
+}
+```
+
+```{r}
+generate_lagged_df <- function(df, p, q, r, s) {
+  
+  # Initialize a new dataframe with just the 'Date' column
+  new_df <- data.frame(Date = df$Date, Returns = df$Returns)
+  
+  for (i in 1:p) {
+    new_df[[paste0("Lag_Returns_", i)]] <- dplyr::lag(df$Returns, i)
+  }
+  
+  # Add the 'Residuals' column and q lagged 'Residuals' columns
+  new_df$Residuals <- df$Residuals
+  for (i in 1:q) {
+    new_df[[paste0("Lag_Residuals_", i)]] <- dplyr::lag(df$Residuals, i)
+  }
+  
+  # Add the 'Variance' column and r lagged 'Variance' columns
+  new_df$Variance <- df$Variance
+  for (i in 1:r) {
+    new_df[[paste0("Lag_Variance_", i)]] <- dplyr::lag(df$Variance, i)
+  }
+  
+  # Add the 'Squared_Residuals' column and s lagged 'Squared_Residuals' columns
+  new_df$Squared_Residuals <- df$Squared_Residuals
+  for (i in 1:s) {
+    new_df[[paste0("Lag_Squared_Residuals_", i)]] <- dplyr::lag(df$Squared_Residuals, i)
+  }
+  
+  # Return the dataframe
+  return(new_df)
+}
+```
+
+## Execute
+
+```{r}
+# Generate output df
+variables_df <- generate_var_res_dataframe(ts_ret, best_p, best_q, best_r, best_s)
+output_df <- generate_lagged_df(variables_df, best_p, best_q, best_r, best_s)
+write.csv(output_df, "output/apple_garch.csv", row.names = FALSE)
+    
+```
